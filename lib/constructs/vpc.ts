@@ -10,11 +10,11 @@ export class Vpc extends Construct {
     super(scope, id);
 
     this.vpc = new cdk.aws_ec2.Vpc(this, "Default", {
-      ipAddresses: cdk.aws_ec2.IpAddresses.cidr("10.10.10.0/24"),
+      ipAddresses: cdk.aws_ec2.IpAddresses.cidr("10.10.10.0/22"),
       enableDnsHostnames: true,
       enableDnsSupport: true,
       natGateways: 0,
-      maxAzs: 2,
+      maxAzs: 4,
       subnetConfiguration: [
         {
           name: "Public",

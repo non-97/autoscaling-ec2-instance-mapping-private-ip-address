@@ -1,88 +1,98 @@
 #!/bin/bash
 
-set -ue
+set -u
 
 # Redirect /var/log/user-data.log and /dev/console
 exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
 
 declare -r max_retry_interval=8
 declare -r max_retries=16
-declare -r hostname_prefix=web-
-declare -r hostname_domain=corp.non-97.net
-declare -r filter_tag_key=aws:autoscaling:groupName
-declare -r filter_tag_value=asg
 
 # Get my instance ID
-token=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-instance_id=$(curl -s -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/instance-id")
+token=$(curl \
+  -s \
+  -X PUT \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+  "http://169.254.169.254/latest/api/token"
+)
+instance_id=$(curl \
+  -s \
+  -H "X-aws-ec2-metadata-token: $token" \
+  "http://169.254.169.254/latest/meta-data/instance-id"
+)
+
+# MAC Address
+mac_address=$(curl \
+  -s \
+  -H "X-aws-ec2-metadata-token: $token" \
+  "http://169.254.169.254/latest/meta-data/mac"
+)
+
+# Subnet ID
+region=$(curl \
+  -s \
+  -H "X-aws-ec2-metadata-token: $token" \
+  "http://169.254.169.254/latest/meta-data/placement/region"
+)
+
+# Subnet ID
+subnet_id=$(curl \
+  -s \
+  -H "X-aws-ec2-metadata-token: $token" \
+  "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$mac_address/subnet-id"
+)
 
 for i in $(seq 1 $max_retries); do
-  echo "======================================================="
-
-  hostname_list=($(aws ec2 describe-instances \
-    --filters Name=tag:$filter_tag_key,Values=$filter_tag_value \
-      Name=instance-state-code,Values=0,16 \
-    --query "Reservations[].Instances[].[Tags[?Key=='HostName'].Value][]" \
-    --output text \
-    | grep $hostname_prefix \
-    | sort -n
-  ))
-
-  # Initialize the expected next number to 1
-  candidate_hostname_number="1"
-  
-  for hostname in "${hostname_list[@]}"; do
-    hostname_number=$(echo $hostname | grep -o -E '[0-9]+$')
-    
-    echo "--------------------------------------------------"
-    echo candidate_hostname_number : $candidate_hostname_number
-    echo hostname : $hostname
-    echo hostname_number : $hostname_number
-  
-    if [[ $((10#$hostname_number)) -ne $candidate_hostname_number ]]; then
-      break
-    fi
-    candidate_hostname_number=$(($candidate_hostname_number+1))
-  done
-  
-  candidate_hostname=$(printf "%s%02d" $hostname_prefix $candidate_hostname_number)
-  echo "--------------------------------------------------"
-  echo candidate_hostname : $candidate_hostname
-
-  # Set HostName tag
-  aws ec2 create-tags \
-    --resources $instance_id \
-    --tags Key=HostName,Value=$candidate_hostname
-
-  # Get sorted instance IDs with HostName tag
-  instance_ids=($(aws ec2 describe-instances \
-    --filters Name=tag:$filter_tag_key,Values=$filter_tag_value \
-      Name=tag:HostName,Values=$candidate_hostname \
-      Name=instance-state-code,Values=0,16 \
-    --query "Reservations[].Instances[].[InstanceId]" \
+  # Available ENI ID
+  eni_id=$(aws ec2 describe-network-interfaces \
+    --filters Name=subnet-id,Values=$subnet_id \
+      Name=status,Values=available \
+    --query 'sort_by(NetworkInterfaces[], &TagSet[?Key==`HostName`].Value | [0])[].NetworkInterfaceId | [0]' \
+    --region $region \
     --output text
-  ))
-  
-  echo "--------------------------------------------------"
+  )
 
-  # Check if the instance itself is the only one holding the hostname
-  if [[ "${instance_ids[0]}" == "$instance_id" && "${#instance_ids[@]}" == 1 ]]; then
-    # Set OS hostname and break the loop
-    echo "Set HostName ${candidate_hostname}.${hostname_domain}"
-    hostnamectl set-hostname "${candidate_hostname}.${hostname_domain}"
-    
-    echo "hostnamectl :
-      $(hostnamectl)"
-    break
-  else
-    # Remove the HostName tag and retry
-    aws ec2 delete-tags \
-      --resources $instance_id \
-      --tags Key=HostName
-
+  if [[ $eni_id == 'None' ]]; then
     retry_interval=$(($RANDOM % $max_retry_interval))
 
-    echo "Failed to allocate hostname $candidate_hostname, retrying in $retry_interval seconds..."
+    echo "ENI not found, retrying in $retry_interval seconds..."
+    sleep $retry_interval
+
+    continue
+  fi
+
+  # Attach ENI
+  aws ec2 attach-network-interface \
+    --instance-id=$instance_id \
+    --device-index=1 \
+    --network-interface-id=$eni_id \
+    --region $region
+
+  if [[ $? == 0 ]]; then
+    hostname=$(aws ec2 describe-network-interfaces \
+      --network-interface-ids $eni_id \
+      --query "NetworkInterfaces[].TagSet[?Key=='HostName'].Value" \
+      --region $region \
+      --output text
+    )
+
+    echo "Set HostName ${hostname}"
+
+    aws ec2 create-tags \
+      --resources $instance_id \
+      --tags Key=HostName,Value=$hostname \
+      --region $region
+
+    hostnamectl set-hostname "${hostname}"
+
+    echo "hostnamectl :
+      $(hostnamectl)"
+
+    break
+  else
+    retry_interval=$(($RANDOM % $max_retry_interval))
+
+    echo "Failed to attach ENI, retrying in $retry_interval seconds..."
     sleep $retry_interval
   fi
 done
